@@ -51,8 +51,11 @@ class MultitaskBERT(nn.Module):
                 param.requires_grad = False
             elif config.option == 'finetune':
                 param.requires_grad = True
+        
         ### TODO
-        raise NotImplementedError
+        self.sentiment_classifier = nn.Linear(BERT_HIDDEN_SIZE, N_SENTIMENT_CLASSES)
+        self.paraphrase_classifier = nn.Linear(BERT_HIDDEN_SIZE * 2, 1)
+        self.similarity_classifier = nn.Linear(BERT_HIDDEN_SIZE * 2, 1)
 
 
     def forward(self, input_ids, attention_mask):
@@ -62,7 +65,10 @@ class MultitaskBERT(nn.Module):
         # When thinking of improvements, you can later try modifying this
         # (e.g., by adding other layers).
         ### TODO
-        raise NotImplementedError
+        bert_output = self.bert(input_ids, attention_mask=attention_mask)
+        last_hidden_state = bert_output["last_hidden_state"]
+        cls_embedding = last_hidden_state[:, 0, :]
+        return cls_embedding
 
 
     def predict_sentiment(self, input_ids, attention_mask):
@@ -72,7 +78,9 @@ class MultitaskBERT(nn.Module):
         Thus, your output should contain 5 logits for each sentence.
         '''
         ### TODO
-        raise NotImplementedError
+        cls_embeddings = self.forward(input_ids, attention_mask)
+        sentiment_logits = self.sentiment_classifier(cls_embeddings)
+        return sentiment_logits
 
 
     def predict_paraphrase(self,
@@ -82,8 +90,11 @@ class MultitaskBERT(nn.Module):
         Note that your output should be unnormalized (a logit); it will be passed to the sigmoid function
         during evaluation, and handled as a logit by the appropriate loss function.
         '''
-        ### TODO
-        raise NotImplementedError
+        cls_embeddings_1 = self.forward(input_ids_1, attention_mask_1)
+        cls_embeddings_2 = self.forward(input_ids_2, attention_mask_2)
+        concatenated_embeddings = torch.cat((cls_embeddings_1, cls_embeddings_2), dim=1)
+        paraphrase_logit = self.paraphrase_classifier(concatenated_embeddings)
+        return paraphrase_logit
 
 
     def predict_similarity(self,
@@ -93,8 +104,11 @@ class MultitaskBERT(nn.Module):
         Note that your output should be unnormalized (a logit); it will be passed to the sigmoid function
         during evaluation, and handled as a logit by the appropriate loss function.
         '''
-        ### TODO
-        raise NotImplementedError
+        cls_embeddings_1 = self.forward(input_ids_1, attention_mask_1)
+        cls_embeddings_2 = self.forward(input_ids_2, attention_mask_2)
+        concatenated_embeddings = torch.cat((cls_embeddings_1, cls_embeddings_2), dim=1)
+        similarity_logit = self.similarity_classifier(concatenated_embeddings)
+        return similarity_logit
 
 
 
@@ -168,6 +182,7 @@ def train_multitask(args):
 
             train_loss += loss.item()
             num_batches += 1
+            print(num_batches)
 
         train_loss = train_loss / (num_batches)
 

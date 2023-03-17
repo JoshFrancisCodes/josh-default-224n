@@ -77,6 +77,7 @@ class MultitaskBERT(nn.Module):
             
             masked_hidden_states = last_hidden_state[input_indices, masked_positions_flat]
             attention_weights = self.self_supervised_attention(masked_hidden_states)
+            attention_weights = attention_weights.float()
             return cls_embedding, attention_weights
         else:
             return cls_embedding
@@ -187,10 +188,10 @@ def train_multitask(args):
 
             # Check whether the batch contains masked_positions1 and masked_positions2
             if 'masked_positions1' in batch and 'masked_positions2' in batch:
-                b_masked_positions1 = batch['masked_positions1'].to(device)
-                b_masked_positions2 = batch['masked_positions2'].to(device)
+                b_masked_positions1 = batch['masked_positions1'].to(device).long()
+                b_masked_positions2 = batch['masked_positions2'].to(device).long()
             else:
-                b_masked_positions = batch['masked_positions'].to(device)
+                b_masked_positions = batch['masked_positions'].to(device).long()
 
             optimizer.zero_grad()
 

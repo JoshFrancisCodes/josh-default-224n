@@ -72,7 +72,7 @@ class MultitaskBERT(nn.Module):
         
         if masked_positions is not None:
             batch_size, num_masked_positions = masked_positions.size()
-            masked_positions_flat = masked_positions.view(-1)
+            masked_positions_flat = masked_positions.view(-1).long()
             input_indices = torch.arange(batch_size).view(-1, 1).repeat(1, num_masked_positions).view(-1)
             
             masked_hidden_states = last_hidden_state[input_indices, masked_positions_flat]

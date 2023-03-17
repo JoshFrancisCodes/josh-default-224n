@@ -15,6 +15,8 @@ from datasets import SentenceClassificationDataset, SentencePairDataset, \
 
 from evaluation import model_eval_sst, test_model_multitask
 
+from transformers import DataCollatorForLanguageModeling
+
 
 TQDM_DISABLE=False
 
@@ -56,9 +58,10 @@ class MultitaskBERT(nn.Module):
         self.sentiment_classifier = nn.Linear(BERT_HIDDEN_SIZE, N_SENTIMENT_CLASSES)
         self.paraphrase_classifier = nn.Linear(BERT_HIDDEN_SIZE * 2, 1)
         self.similarity_classifier = nn.Linear(BERT_HIDDEN_SIZE * 2, 1)
+        self.self_supervised_attention = nn.Linear(BERT_HIDDEN_SIZE, BERT_HIDDEN_SIZE)
 
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, masked_positions=None):
         'Takes a batch of sentences and produces embeddings for them.'
         # The final BERT embedding is the hidden state of [CLS] token (the first token)
         # Here, you can start by just returning the embeddings straight from BERT.
@@ -68,7 +71,17 @@ class MultitaskBERT(nn.Module):
         bert_output = self.bert(input_ids, attention_mask=attention_mask)
         last_hidden_state = bert_output["last_hidden_state"]
         cls_embedding = last_hidden_state[:, 0, :]
-        return cls_embedding
+        
+        if masked_positions is not None:
+            batch_size, num_masked_positions = masked_positions.size()
+            masked_positions_flat = masked_positions.view(-1)
+            input_indices = torch.arange(batch_size).view(-1, 1).repeat(1, num_masked_positions).view(-1)
+            
+            masked_hidden_states = last_hidden_state[input_indices, masked_positions_flat]
+            attention_weights = self.self_supervised_attention(masked_hidden_states)
+            return cls_embedding, attention_weights
+        else:
+            return cls_embedding
 
 
     def predict_sentiment(self, input_ids, attention_mask):
@@ -164,6 +177,7 @@ def train_multitask(args):
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0
+        train_ssa_loss = 0
         num_batches = 0
         for batch in tqdm(sst_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
             b_ids, b_mask, b_labels = (batch['token_ids'],
@@ -173,14 +187,42 @@ def train_multitask(args):
             b_mask = b_mask.to(device)
             b_labels = b_labels.to(device)
 
-            optimizer.zero_grad()
-            logits = model.predict_sentiment(b_ids, b_mask)
-            loss = F.cross_entropy(logits, b_labels.view(-1), reduction='sum') / args.batch_size
+            # Check whether the batch contains masked_positions1 and masked_positions2
+            if 'masked_positions1' in batch and 'masked_positions2' in batch:
+                b_masked_positions1 = batch['masked_positions1'].to(device)
+                b_masked_positions2 = batch['masked_positions2'].to(device)
+            else:
+                b_masked_positions = batch['masked_positions'].to(device)
 
-            loss.backward()
+            optimizer.zero_grad()
+
+            # Handle the case when it's a SentencePairDataset
+            if 'masked_positions1' in batch and 'masked_positions2' in batch:
+                num_masked_positions = b_masked_positions1.size(1)
+                cls_embeddings1, attention_weights1 = model.forward(b_ids, b_mask, b_masked_positions1)
+                cls_embeddings2, attention_weights2 = model.forward(b_ids, b_mask, b_masked_positions2)
+
+                cls_embeddings = torch.cat((cls_embeddings1, cls_embeddings2), dim=1)
+                sentiment_logits = model.sentiment_classifier(cls_embeddings)
+                ssa_loss = F.cross_entropy(attention_weights1, b_masked_positions1.view(-1), reduction='sum',ignore_index=-1) / (args.batch_size * num_masked_positions)
+                ssa_loss += F.cross_entropy(attention_weights2, b_masked_positions2.view(-1), reduction='sum',ignore_index=-1) / (args.batch_size * num_masked_positions)
+            # Handle the case when it's a SentenceClassificationDataset
+            else:
+                num_masked_positions = b_masked_positions.size(1)
+                cls_embeddings, attention_weights = model.forward(b_ids, b_mask, b_masked_positions)
+                sentiment_logits = model.sentiment_classifier(cls_embeddings)
+                ssa_loss = F.cross_entropy(attention_weights, b_masked_positions.view(-1), reduction='sum',ignore_index=-1) / (args.batch_size * num_masked_positions)
+
+            loss = F.cross_entropy(sentiment_logits, b_labels.view(-1), reduction='sum') / args.batch_size
+
+            # Combine the two losses
+            total_loss = loss + args.ssa_loss_weight * ssa_loss
+
+            total_loss.backward()
             optimizer.step()
 
             train_loss += loss.item()
+            train_ssa_loss += ssa_loss.item()
             num_batches += 1
 
         train_loss = train_loss / (num_batches)
@@ -245,6 +287,9 @@ def get_args():
     parser.add_argument("--hidden_dropout_prob", type=float, default=0.3)
     parser.add_argument("--lr", type=float, help="learning rate, default lr for 'pretrain': 1e-3, 'finetune': 1e-5",
                         default=1e-5)
+    
+    parser.add_argument("--ssa_loss_weight", type=float, default=1.0, help="Weight of self-supervised attention loss")
+
 
     args = parser.parse_args()
     return args

@@ -13,6 +13,7 @@ import csv
 import torch
 from torch.utils.data import Dataset
 from tokenizer import BertTokenizer
+import random
 
 
 def preprocess_string(s):
@@ -25,9 +26,10 @@ def preprocess_string(s):
 
 
 class SentenceClassificationDataset(Dataset):
-    def __init__(self, dataset, args):
+    def __init__(self, dataset, args, mask_probability=0.15):
         self.dataset = dataset
         self.p = args
+        self.mask_probability = mask_probability
         self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
     def __len__(self):
@@ -46,18 +48,31 @@ class SentenceClassificationDataset(Dataset):
         token_ids = torch.LongTensor(encoding['input_ids'])
         attention_mask = torch.LongTensor(encoding['attention_mask'])
         labels = torch.LongTensor(labels)
+        
+        # Add code to mask tokens
+        masked_positions = []
+        for sent in token_ids:
+            positions = [i for i, token in enumerate(sent) if self.tokenizer.convert_ids_to_tokens(token.item()) not in ["[CLS]", "[SEP]", "[PAD]"]]
+            masked_count = int(len(positions) * self.mask_probability)
+            random.shuffle(positions)
+            mask_indices = positions[:masked_count]
+            sent[mask_indices] = self.tokenizer.mask_token_id
+            masked_positions.append(torch.tensor(mask_indices))
 
-        return token_ids, attention_mask, labels, sents, sent_ids
+        masked_positions = torch.nn.utils.rnn.pad_sequence(masked_positions, batch_first=True, padding_value=-1)
+
+        return token_ids, attention_mask, labels, sents, sent_ids, masked_positions
 
     def collate_fn(self, all_data):
-        token_ids, attention_mask, labels, sents, sent_ids= self.pad_data(all_data)
+        token_ids, attention_mask, labels, sents, sent_ids, masked_positions = self.pad_data(all_data)
 
         batched_data = {
                 'token_ids': token_ids,
                 'attention_mask': attention_mask,
                 'labels': labels,
                 'sents': sents,
-                'sent_ids': sent_ids
+                'sent_ids': sent_ids,
+                'masked_positions': masked_positions
             }
 
         return batched_data
@@ -99,10 +114,11 @@ class SentenceClassificationTestDataset(Dataset):
 
 
 class SentencePairDataset(Dataset):
-    def __init__(self, dataset, args, isRegression =False):
+    def __init__(self, dataset, args, isRegression =False, mask_probability=0.15):
         self.dataset = dataset
         self.p = args
         self.isRegression = isRegression
+        self.mask_probability = mask_probability
         self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
     def __len__(self):
@@ -132,15 +148,29 @@ class SentencePairDataset(Dataset):
         else:
             labels = torch.LongTensor(labels)
             
+        # Add code to mask tokens for both sent1 and sent2
+        masked_positions = []
+        for sent in [token_ids, token_ids2]:
+            sent_masked_positions = []
+            for s in sent:
+                positions = [i for i, token in enumerate(s) if self.tokenizer.convert_ids_to_tokens(token.item()) not in ["[CLS]", "[SEP]", "[PAD]"]]
+                masked_count = int(len(positions) * self.mask_probability)
+                random.shuffle(positions)
+                mask_indices = positions[:masked_count]
+                s[mask_indices] = self.tokenizer.mask_token_id
+                sent_masked_positions.append(torch.tensor(mask_indices))
+
+            masked_positions.append(torch.nn.utils.rnn.pad_sequence(sent_masked_positions, batch_first=True, padding_value=-1))  
+            
 
         return (token_ids, token_type_ids, attention_mask,
                 token_ids2, token_type_ids2, attention_mask2,
-                labels,sent_ids)
+                labels,sent_ids, *masked_positions)
 
     def collate_fn(self, all_data):
         (token_ids, token_type_ids, attention_mask,
          token_ids2, token_type_ids2, attention_mask2,
-         labels, sent_ids) = self.pad_data(all_data)
+         labels, sent_ids, masked_positions1, masked_positions2) = self.pad_data(all_data)
 
         batched_data = {
                 'token_ids_1': token_ids,
@@ -150,7 +180,9 @@ class SentencePairDataset(Dataset):
                 'token_type_ids_2': token_type_ids2,
                 'attention_mask_2': attention_mask2,
                 'labels': labels,
-                'sent_ids': sent_ids
+                'sent_ids': sent_ids,
+                'masked_positions_1': masked_positions1,
+                'masked_positions_2': masked_positions2
             }
 
         return batched_data

@@ -15,8 +15,6 @@ from datasets import SentenceClassificationDataset, SentencePairDataset, \
 
 from evaluation import model_eval_sst, test_model_multitask
 
-from transformers import DataCollatorForLanguageModeling
-
 
 TQDM_DISABLE=False
 

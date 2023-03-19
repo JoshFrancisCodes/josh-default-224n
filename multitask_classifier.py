@@ -240,6 +240,7 @@ def train_multitask(args):
         num_batches = 0
 
         for batch in tqdm(multitask_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
+            batch = {task: {key: tensor.to(device) if isinstance(tensor, torch.Tensor) else tensor for key, tensor in task_batch.items()} for task, task_batch in batch.items()}
             sst_batch = batch["sst"]
             para_batch = batch["para"]
             sts_batch = batch["sts"]

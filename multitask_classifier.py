@@ -174,7 +174,7 @@ def train_multitask(args):
     
     # Load data
     sst_train_data, para_train_data, sts_train_data, squad_train_data, num_labels = load_multitask_data(args.sst_train,args.para_train,args.sts_train,args.squad_train, split ='train')
-    sst_dev_data, para_dev_data, sts_dev_data, squad_dev_data, num_labels = load_multitask_data(args.sst_dev,args.para_dev,args.sts_dev,args.squad_dev, split ='test')
+    sst_dev_data, para_dev_data, sts_dev_data, squad_dev_data, num_labels = load_multitask_data(args.sst_dev,args.para_dev,args.sts_dev,args.squad_dev, split ='dev')
     
     # Create the datasets
     sst_train_data = SentenceClassificationDataset(sst_train_data, args)

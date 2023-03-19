@@ -428,7 +428,7 @@ def load_multitask_test_data():
 
 
 
-def load_multitask_data(sentiment_filename,paraphrase_filename,similarity_filename,squad_filename,split='train'):
+def load_multitask_data(sentiment_filename,paraphrase_filename,similarity_filename,squad_filename=None,split='train'):
     sentiment_data = []
     num_labels = {}
     if split == 'test':
@@ -490,6 +490,9 @@ def load_multitask_data(sentiment_filename,paraphrase_filename,similarity_filena
     print(f"Loaded {len(similarity_data)} {split} examples from {similarity_filename}")
     
     squad_data = []
+    if squad_filename == None:
+        return sentiment_data, paraphrase_data, similarity_data, num_labels
+    
     if split == 'test':
         with open(squad_filename, 'r') as fp:
             squad_raw_data = json.load(fp)

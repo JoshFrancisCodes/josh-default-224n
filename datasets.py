@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import Dataset
 from tokenizer import BertTokenizer
 import random
+import json
 
 
 def preprocess_string(s):
@@ -23,6 +24,80 @@ def preprocess_string(s):
                     .replace(',', ' ,')
                     .replace('\'', ' \'')
                     .split())
+    
+class MultitaskDataset(Dataset):
+    def __init__(self, *datasets):
+        self.datasets = datasets
+
+    def __getitem__(self, index):
+        return tuple(dataset[index % len(dataset)] for dataset in self.datasets)
+
+    def __len__(self):
+        return max(len(dataset) for dataset in self.datasets)
+    
+    def collate_fn(self, data):
+        sst_batch, para_batch, sts_batch, squad_batch = zip(*data)
+
+        # Collate each task's data
+        sst_collated = SentenceClassificationDataset.collate_fn(sst_batch)
+        para_collated = SentencePairDataset.collate_fn(para_batch)
+        sts_collated = SentencePairDataset.collate_fn(sts_batch)
+        squad_collated = SquadDataset.collate_fn(squad_batch)
+
+        # Combine the collated data into a single dictionary
+        multitask_collated = {
+            "sst": sst_collated,
+            "para": para_collated,
+            "sts": sts_collated,
+            "squad": squad_collated
+        }
+
+        return multitask_collated
+
+    
+class SquadDataset(Dataset):
+    def __init__(self, dataset, args, mask_probability=0.15):
+        self.dataset = dataset
+        self.p = args
+        self.mask_probability = mask_probability
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        return self.dataset[idx]
+
+    def pad_data(self, data):
+        questions = [x[0] for x in data]
+        contexts = [x[1] for x in data]
+        start_positions = [x[2] for x in data]
+        end_positions = [x[3] for x in data]
+        sent_ids = [x[4] for x in data]
+
+        encoding = self.tokenizer(questions, contexts, return_tensors='pt', padding=True, truncation=True)
+        token_ids = torch.LongTensor(encoding['input_ids'])
+        attention_mask = torch.LongTensor(encoding['attention_mask'])
+        token_type_ids = torch.LongTensor(encoding['token_type_ids'])
+
+        start_positions = torch.LongTensor(start_positions)
+        end_positions = torch.LongTensor(end_positions)
+
+        return token_ids, token_type_ids, attention_mask, start_positions, end_positions, sent_ids
+
+    def collate_fn(self, all_data):
+        token_ids, token_type_ids, attention_mask, start_positions, end_positions, sent_ids = self.pad_data(all_data)
+
+        batched_data = {
+                'token_ids': token_ids,
+                'token_type_ids': token_type_ids,
+                'attention_mask': attention_mask,
+                'start_positions': start_positions,
+                'end_positions': end_positions,
+                'sent_ids': sent_ids
+            }
+
+        return batched_data
 
 
 class SentenceClassificationDataset(Dataset):
@@ -243,9 +318,9 @@ def load_multitask_test_data():
     paraphrase_filename = f'data/quora-test.csv'
     sentiment_filename = f'data/ids-sst-test.txt'
     similarity_filename = f'data/sts-test.csv'
+    squad_filename = f'data/squad-test.csv'
 
     sentiment_data = []
-
     with open(sentiment_filename, 'r') as fp:
         for record in csv.DictReader(fp,delimiter = '\t'):
             sent = record['sentence'].lower().strip()
@@ -272,12 +347,22 @@ def load_multitask_test_data():
                                     ))
 
     print(f"Loaded {len(similarity_data)} test examples from {similarity_filename}")
+    
+    squad_data = []
+    with open(squad_filename, 'r') as fp:
+            squad_raw_data = json.load(fp)
+            for article in squad_raw_data['data']:
+                for paragraph in article['paragraphs']:
+                    context = paragraph['context']
+                    for qa in paragraph['qas']:
+                        question = qa['question']
+                        squad_data.append((context, question))
 
-    return sentiment_data, paraphrase_data, similarity_data
+    return sentiment_data, paraphrase_data, similarity_data, squad_data
 
 
 
-def load_multitask_data(sentiment_filename,paraphrase_filename,similarity_filename,split='train'):
+def load_multitask_data(sentiment_filename,paraphrase_filename,similarity_filename,squad_filename,split='train'):
     sentiment_data = []
     num_labels = {}
     if split == 'test':
@@ -337,5 +422,30 @@ def load_multitask_data(sentiment_filename,paraphrase_filename,similarity_filena
                                         float(record['similarity']),sent_id))
 
     print(f"Loaded {len(similarity_data)} {split} examples from {similarity_filename}")
+    
+    squad_data = []
+    if split == 'test':
+        with open(squad_filename, 'r') as fp:
+            squad_raw_data = json.load(fp)
+            for article in squad_raw_data['data']:
+                for paragraph in article['paragraphs']:
+                    context = paragraph['context']
+                    for qa in paragraph['qas']:
+                        question = qa['question']
+                        id = qa['id']
+                        squad_data.append((context, question, id))
+    else:
+        with open(squad_filename, 'r') as fp:
+            squad_raw_data = json.load(fp)
+            for article in squad_raw_data['data']:
+                for paragraph in article['paragraphs']:
+                    context = paragraph['context']
+                    for qa in paragraph['qas']:
+                        question = qa['question']
+                        id = qa['id']
+                        answers = qa['answers']
+                        squad_data.append((context, question, answers, id))
 
-    return sentiment_data, num_labels, paraphrase_data, similarity_data
+    print(f"Loaded {len(squad_data)} {split} examples from {squad_filename}")
+
+    return sentiment_data, paraphrase_data, similarity_data, squad_data, num_labels

@@ -11,9 +11,9 @@ from optimizer import AdamW
 from tqdm import tqdm
 
 from datasets import SentenceClassificationDataset, SentencePairDataset, \
-    load_multitask_data, load_multitask_test_data
+    load_multitask_data, load_multitask_test_data, SquadDataset, MultitaskDataset
 
-from evaluation import model_eval_sst, test_model_multitask
+from evaluation import model_eval_sst, test_model_multitask, model_eval_multitask
 
 
 TQDM_DISABLE=False
@@ -57,6 +57,7 @@ class MultitaskBERT(nn.Module):
         self.paraphrase_classifier = nn.Linear(BERT_HIDDEN_SIZE * 2, 1)
         self.similarity_classifier = nn.Linear(BERT_HIDDEN_SIZE * 2, 1)
         self.self_supervised_attention = nn.Linear(BERT_HIDDEN_SIZE, BERT_HIDDEN_SIZE)
+        self.qa_classifier = nn.Linear(BERT_HIDDEN_SIZE, 2)
 
 
     def forward(self, input_ids, attention_mask, masked_positions=None):
@@ -121,6 +122,19 @@ class MultitaskBERT(nn.Module):
         concatenated_embeddings = torch.cat((cls_embeddings_1, cls_embeddings_2), dim=1)
         similarity_logit = self.similarity_classifier(concatenated_embeddings)
         return similarity_logit
+    
+    def predict_qa(self, input_ids, attention_mask):
+        '''Given a batch of context-question pairs, outputs logits for the start and end positions of the answer span.
+        The output should be a tuple containing two tensors:
+        - start_logits: a tensor of shape (batch_size, sequence_length)
+        - end_logits: a tensor of shape (batch_size, sequence_length)
+        '''
+        cls_embeddings = self.forward(input_ids, attention_mask)
+        qa_logits = self.qa_classifier(cls_embeddings)  # Shape: (batch_size, sequence_length, 2)
+        start_logits, end_logits = qa_logits.split(1, dim=-1)  # Split along the last dimension
+        start_logits = start_logits.squeeze(-1)  # Shape: (batch_size, sequence_length)
+        end_logits = end_logits.squeeze(-1)  # Shape: (batch_size, sequence_length)
+        return start_logits, end_logits
 
 
 
@@ -140,22 +154,48 @@ def save_model(model, optimizer, args, config, filepath):
     print(f"save the model to {filepath}")
 
 
-## Currently only trains on sst dataset
 def train_multitask(args):
     device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+    
     # Load data
-    # Create the data and its corresponding datasets and dataloader
-    sst_train_data, num_labels,para_train_data, sts_train_data = load_multitask_data(args.sst_train,args.para_train,args.sts_train, split ='train')
-    sst_dev_data, num_labels,para_dev_data, sts_dev_data = load_multitask_data(args.sst_dev,args.para_dev,args.sts_dev, split ='train')
-
+    sst_train_data, para_train_data, sts_train_data, squad_train_data, num_labels = load_multitask_data(args.sst_train,args.para_train,args.sts_train,args.squad_train, split ='train')
+    sst_dev_data, para_dev_data, sts_dev_data, squad_dev_data = load_multitask_data(args.sst_dev,args.para_dev,args.sts_dev,args.squad_dev, split ='train')
+    
+    # Create the datasets
     sst_train_data = SentenceClassificationDataset(sst_train_data, args)
     sst_dev_data = SentenceClassificationDataset(sst_dev_data, args)
 
+    para_train_data = SentencePairDataset(para_train_data, args)
+    para_dev_data = SentencePairDataset(para_dev_data, args)
+    
+    sts_train_data = SentencePairDataset(sts_train_data, args)
+    sts_dev_data = SentencePairDataset(sts_dev_data, args)
+    
+    squad_train_data = SquadDataset(squad_train_data, args)
+    squad_dev_data = SquadDataset(squad_dev_data, args)
+
+    multitask_train_data = MultitaskDataset(sst_train_data, para_train_data, sts_train_data, squad_train_data)
+    multitask_dev_data = MultitaskDataset(sst_dev_data, para_dev_data, sts_dev_data, squad_dev_data)
+    
+    # Create the dataloaders
     sst_train_dataloader = DataLoader(sst_train_data, shuffle=True, batch_size=args.batch_size,
                                       collate_fn=sst_train_data.collate_fn)
     sst_dev_dataloader = DataLoader(sst_dev_data, shuffle=False, batch_size=args.batch_size,
                                     collate_fn=sst_dev_data.collate_fn)
-
+    
+    para_train_dataloader = DataLoader(para_train_data, shuffle=True, batch_size=args.batch_size,
+                                      collate_fn=para_train_data.collate_fn)
+    para_dev_dataloader = DataLoader(para_dev_data, shuffle=False, batch_size=args.batch_size,
+                                    collate_fn=para_dev_data.collate_fn)
+    
+    sts_train_dataloader = DataLoader(sts_train_data, shuffle=True, batch_size=args.batch_size,
+                                      collate_fn=sts_train_data.collate_fn)
+    sts_dev_dataloader = DataLoader(sts_dev_data, shuffle=False, batch_size=args.batch_size,
+                                    collate_fn=sts_dev_data.collate_fn)
+    
+    multitask_train_dataloader = DataLoader(multitask_train_data, shuffle=True, batch_size=args.batch_size,
+                                            collate_fn=MultitaskDataset.collate_fn)
+    
     # Init model
     config = {'hidden_dropout_prob': args.hidden_dropout_prob,
               'num_labels': num_labels,
@@ -171,71 +211,80 @@ def train_multitask(args):
     lr = args.lr
     optimizer = AdamW(model.parameters(), lr=lr)
     best_dev_acc = 0
+    
+    # Define the loss functions for the tasks
+    sst_loss_fn = nn.CrossEntropyLoss()
+    para_loss_fn = nn.BCEWithLogitsLoss()
+    sts_loss_fn = nn.MSELoss()
+    qa_loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
 
     # Run for the specified number of epochs
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0
-        train_ssa_loss = 0
         num_batches = 0
-        for batch in tqdm(sst_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
-            b_ids, b_mask, b_labels = (batch['token_ids'],
-                                       batch['attention_mask'], batch['labels'])
 
-            b_ids = b_ids.to(device)
-            b_mask = b_mask.to(device)
-            b_labels = b_labels.to(device)
-
-            # Check whether the batch contains masked_positions1 and masked_positions2
-            if 'masked_positions1' in batch and 'masked_positions2' in batch:
-                b_masked_positions1 = batch['masked_positions1'].to(device).long()
-                b_masked_positions2 = batch['masked_positions2'].to(device).long()
-            else:
-                b_masked_positions = batch['masked_positions'].to(device).long()
-
+        for batch in tqdm(multitask_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
+            sst_batch = batch["sst"]
+            para_batch = batch["para"]
+            sts_batch = batch["sts"]
+            squad_batch = batch["squad"]
             optimizer.zero_grad()
 
-            # Handle the case when it's a SentencePairDataset
-            if 'masked_positions1' in batch and 'masked_positions2' in batch:
-                num_masked_positions = b_masked_positions1.size(1)
-                cls_embeddings1, attention_weights1 = model.forward(b_ids, b_mask, b_masked_positions1)
-                cls_embeddings2, attention_weights2 = model.forward(b_ids, b_mask, b_masked_positions2)
+            # Process the SST batch
+            sst_logits, sst_attention_weights = model.predict_sentiment_ssa(sst_batch["token_ids"], sst_batch["attention_mask"], sst_batch["masked_positions"])
+            sst_loss = sst_loss_fn(sst_logits, sst_batch["labels"])
+            sst_ssa_loss = F.cross_entropy(sst_attention_weights, sst_batch["masked_positions"].view(-1), reduction='sum', ignore_index=-1) / (args.batch_size * sst_batch["masked_positions"].size(1))
 
-                cls_embeddings = torch.cat((cls_embeddings1, cls_embeddings2), dim=1)
-                sentiment_logits = model.sentiment_classifier(cls_embeddings)
-                ssa_loss = F.cross_entropy(attention_weights1, b_masked_positions1.view(-1), reduction='sum',ignore_index=-1) / (args.batch_size * num_masked_positions)
-                ssa_loss += F.cross_entropy(attention_weights2, b_masked_positions2.view(-1), reduction='sum',ignore_index=-1) / (args.batch_size * num_masked_positions)
-            # Handle the case when it's a SentenceClassificationDataset
-            else:
-                num_masked_positions = b_masked_positions.size(1)
-                cls_embeddings, attention_weights = model.forward(b_ids, b_mask, b_masked_positions)
-                sentiment_logits = model.sentiment_classifier(cls_embeddings)
-                ssa_loss = F.cross_entropy(attention_weights, b_masked_positions.view(-1), reduction='sum',ignore_index=-1) / (args.batch_size * num_masked_positions)
+            # Process the paraphrase batch
+            para_logits, para_attention_weights = model.predict_paraphrase_ssa(para_batch["token_ids1"], para_batch["attention_mask1"], para_batch["masked_positions1"],
+                                                                            para_batch["token_ids2"], para_batch["attention_mask2"], para_batch["masked_positions2"])
+            para_loss = para_loss_fn(para_logits.squeeze(-1), para_batch["labels"])
+            para_ssa_loss = F.cross_entropy(para_attention_weights, para_batch["masked_positions1"].view(-1), reduction='sum', ignore_index=-1) / (args.batch_size * para_batch["masked_positions1"].size(1))
+            para_ssa_loss += F.cross_entropy(para_attention_weights, para_batch["masked_positions2"].view(-1), reduction='sum', ignore_index=-1) / (args.batch_size * para_batch["masked_positions2"].size(1))
 
-            loss = F.cross_entropy(sentiment_logits, b_labels.view(-1), reduction='sum') / args.batch_size
+            # Process the STS batch
+            sts_logits, sts_attention_weights = model.predict_similarity_ssa(sts_batch["token_ids1"], sts_batch["attention_mask1"], sts_batch["masked_positions1"],
+                                                                            sts_batch["token_ids2"], sts_batch["attention_mask2"], sts_batch["masked_positions2"])
+            sts_loss = sts_loss_fn(sts_logits.squeeze(-1), sts_batch["labels"])
+            sts_ssa_loss = F.cross_entropy(sts_attention_weights, sts_batch["masked_positions1"].view(-1), reduction='sum', ignore_index=-1) / (args.batch_size * sts_batch["masked_positions1"].size(1))
+            sts_ssa_loss += F.cross_entropy(sts_attention_weights, sts_batch["masked_positions2"].view(-1), reduction='sum', ignore_index=-1) / (args.batch_size * sts_batch["masked_positions2"].size(1))
 
-            # Combine the two losses
-            total_loss = loss + args.ssa_loss_weight * ssa_loss
+            # Process the SQuAD batch
+            squad_start_logits, squad_end_logits, squad_attention_weights = model.predict_qa_ssa(squad_batch["token_ids"], squad_batch["attention_mask"], squad_batch["masked_positions"])
+            qa_start_loss = qa_loss_fn(squad_start_logits, squad_batch["start_positions"])
+            qa_end_loss = qa_loss_fn(squad_end_logits, squad_batch["end_positions"])
+            qa_loss = (qa_start_loss + qa_end_loss) / 2
+            squad_ssa_loss = F.cross_entropy(squad_attention_weights, squad_batch["masked_positions"].view(-1), reduction='sum', ignore_index=-1) / (args.batch_size * squad_batch["masked_positions"].size(1))
+
+            # Combine the losses
+            total_loss = sst_loss + args.ssa_loss_weight * sst_ssa_loss \
+                    + para_loss + args.ssa_loss_weight * para_ssa_loss \
+                    + sts_loss + args.ssa_loss_weight * sts_ssa_loss \
+                    + qa_loss + args.ssa_loss_weight * squad_ssa_loss
 
             total_loss.backward()
             optimizer.step()
 
-            train_loss += loss.item()
-            train_ssa_loss += ssa_loss.item()
+            train_loss += total_loss.item()
             num_batches += 1
 
-        train_loss = train_loss / (num_batches)
+        train_loss = train_loss / num_batches
 
-        train_acc, train_f1, *_ = model_eval_sst(sst_train_dataloader, model, device)
-        dev_acc, dev_f1, *_ = model_eval_sst(sst_dev_dataloader, model, device)
+        # Evaluate the model on each task
+        para_train_acc, _, _, sst_train_acc, _, _, sts_train_ac, _, _ = model_eval_multitask(sst_train_dataloader, para_train_dataloader, sts_train_dataloader, model, device)
+        para_dev_acc, _, _, sst_dev_acc, _, _, sts_dev_ac, _, _ = model_eval_multitask(sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader, model, device)
 
-        if dev_acc > best_dev_acc:
-            best_dev_acc = dev_acc
+        # Save the model if the dev performance improves
+        avg_dev_acc = (para_dev_acc + sst_dev_acc + sts_dev_ac) / 3
+        if avg_dev_acc > best_dev_acc:
+            best_dev_acc = avg_dev_acc
             save_model(model, optimizer, args, config, args.filepath)
 
-        print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f}")
-
-
+        print(f"Epoch {epoch}: train loss :: {train_loss :.3f}")
+        print(f"SST: train acc :: {sst_train_acc :.3f}, dev acc :: {sst_dev_acc :.3f}")
+        print(f"Paraphrase: train acc :: {para_train_acc :.3f}, dev acc :: {para_dev_acc :.3f}")
+        print(f"STS: train acc :: {sts_train_ac :.3f}, dev acc :: {sts_dev_ac :.3f}")
 
 def test_model(args):
     with torch.no_grad():
@@ -280,6 +329,8 @@ def get_args():
 
     parser.add_argument("--sts_dev_out", type=str, default="predictions/sts-dev-output.csv")
     parser.add_argument("--sts_test_out", type=str, default="predictions/sts-test-output.csv")
+    
+    parser.add_argument("--squad_dev_out", type=str, default="predictions/squad-dev-output.csv")
 
     # hyper parameters
     parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
@@ -288,6 +339,11 @@ def get_args():
                         default=1e-5)
     
     parser.add_argument("--ssa_loss_weight", type=float, default=1.0, help="Weight of self-supervised attention loss")
+    
+    parser.add_argument("--finetune_squad", action='store_true', help="Fine-tune on the SQuAD dataset")
+    parser.add_argument("--squad_train", type=str, default="data/train-v2.0.json", help="Path to the SQuAD train dataset")
+    parser.add_argument("--squad_dev", type=str, default="data/dev-v2.0.json", help="Path to the SQuAD dev dataset")
+
 
 
     args = parser.parse_args()

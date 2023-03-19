@@ -84,7 +84,7 @@ class MultitaskBERT(nn.Module):
             attention_weights = attention_weights.float()
             return cls_embedding, attention_weights
         else:
-            return cls_embedding
+            return cls_embedding, None
 
 
     def predict_sentiment(self, input_ids, attention_mask, masked_positions=None):

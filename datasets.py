@@ -69,7 +69,7 @@ class SquadDataset(Dataset):
     def __getitem__(self, idx):
         context, question, answer, example_id = self.dataset[idx]
 
-        encoding = self.tokenizer(question, context)
+        encoding = self.tokenizer(question, context, max_length=512, truncation=True, padding='max_length')
         input_ids = encoding['input_ids']
         token_type_ids = encoding['token_type_ids']
         attention_mask = encoding['attention_mask']

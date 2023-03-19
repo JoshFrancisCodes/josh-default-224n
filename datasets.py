@@ -39,10 +39,10 @@ class MultitaskDataset(Dataset):
         sst_batch, para_batch, sts_batch, squad_batch = zip(*data)
 
         # Collate each task's data
-        sst_collated = SentenceClassificationDataset.collate_fn(sst_batch)
-        para_collated = SentencePairDataset.collate_fn(para_batch)
-        sts_collated = SentencePairDataset.collate_fn(sts_batch)
-        squad_collated = SquadDataset.collate_fn(squad_batch)
+        sst_collated = self.datasets[0].collate_fn(sst_batch)
+        para_collated = self.datasets[1].collate_fn(para_batch)
+        sts_collated = self.datasets[2].collate_fn(sts_batch)
+        squad_collated = self.datasets[3].collate_fn(squad_batch)
 
         # Combine the collated data into a single dictionary
         multitask_collated = {
@@ -54,7 +54,8 @@ class MultitaskDataset(Dataset):
 
         return multitask_collated
 
-    
+
+
 class SquadDataset(Dataset):
     def __init__(self, dataset, args, mask_probability=0.15):
         self.dataset = dataset
@@ -66,38 +67,103 @@ class SquadDataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        return self.dataset[idx]
+        context, question, answer, example_id = self.dataset[idx]
+
+        encoding = self.tokenizer(question, context)
+        input_ids = encoding['input_ids']
+        token_type_ids = encoding['token_type_ids']
+        attention_mask = encoding['attention_mask']
+        
+        answer_start_token_idx = -1
+        answer_end_token_idx = -1
+        
+        if not answer:
+            has_answer = 0
+        else:
+            has_answer = 1
+            answer = answer[0]
+            start_position = ...
+            end_position = ...
+            answer_text = answer['text']
+            answer_start = answer['answer_start']
+            
+            # Get the encoded version of the answer text
+            answer_encoding = self.tokenizer(answer_text)
+            answer_input_ids = answer_encoding['input_ids'][1:-1]  # remove [CLS] and [SEP] tokens
+
+            
+
+            # Loop through the input_ids to find the matching sequence of tokens
+            for i in range(len(input_ids) - len(answer_input_ids) + 1):
+                if input_ids[i:i+len(answer_input_ids)] == answer_input_ids:
+                    answer_start_token_idx = i
+                    answer_end_token_idx = i + len(answer_input_ids) - 1
+                    break
+            
+        return {
+            'input_ids': input_ids,
+            'token_type_ids': token_type_ids,
+            'attention_mask': attention_mask,
+            'start_positions': answer_start_token_idx,
+            'end_positions': answer_end_token_idx,
+            'example_id': example_id,
+            'has_answer': has_answer
+        }
 
     def pad_data(self, data):
-        questions = [x[0] for x in data]
-        contexts = [x[1] for x in data]
-        start_positions = [x[2] for x in data]
-        end_positions = [x[3] for x in data]
-        sent_ids = [x[4] for x in data]
+        input_ids = [torch.tensor(d['input_ids']) for d in data]
+        token_type_ids = [torch.tensor(d['token_type_ids']) for d in data]
+        attention_mask = [torch.tensor(d['attention_mask']) for d in data]
+        start_positions = [d['start_positions'] for d in data]
+        end_positions = [d['end_positions'] for d in data]
+        example_ids = [d['example_id'] for d in data]
+        has_answers = [d['has_answer'] for d in data]
 
-        encoding = self.tokenizer(questions, contexts, return_tensors='pt', padding=True, truncation=True)
-        token_ids = torch.LongTensor(encoding['input_ids'])
-        attention_mask = torch.LongTensor(encoding['attention_mask'])
-        token_type_ids = torch.LongTensor(encoding['token_type_ids'])
+        # Add code to mask tokens
+        masked_positions = []
+        for sent in input_ids:
+            positions = [i for i, token in enumerate(sent) if self.tokenizer.convert_ids_to_tokens(token.item()) not in ["[CLS]", "[SEP]", "[PAD]"]]
+            masked_count = int(len(positions) * self.mask_probability)
+            random.shuffle(positions)
+            mask_indices = positions[:masked_count]
+            sent[mask_indices] = self.tokenizer.mask_token_id
+            masked_positions.append(torch.tensor(mask_indices))
 
-        start_positions = torch.LongTensor(start_positions)
-        end_positions = torch.LongTensor(end_positions)
+        masked_positions = torch.nn.utils.rnn.pad_sequence(masked_positions, batch_first=True, padding_value=-1)
 
-        return token_ids, token_type_ids, attention_mask, start_positions, end_positions, sent_ids
+        padded = self.tokenizer.pad({
+            'input_ids': input_ids,
+            'token_type_ids': token_type_ids,
+            'attention_mask': attention_mask
+        }, return_tensors='pt')
 
-    def collate_fn(self, all_data):
-        token_ids, token_type_ids, attention_mask, start_positions, end_positions, sent_ids = self.pad_data(all_data)
+        return (
+            padded['input_ids'],
+            padded['token_type_ids'],
+            padded['attention_mask'],
+            torch.tensor(start_positions),
+            torch.tensor(end_positions),
+            example_ids,
+            masked_positions,
+            torch.tensor(has_answers)
+        )
+
+    def collate_fn(self, data):
+        input_ids, token_type_ids, attention_mask, start_positions, end_positions, example_ids, masked_positions, has_answers = self.pad_data(data)
 
         batched_data = {
-                'token_ids': token_ids,
-                'token_type_ids': token_type_ids,
-                'attention_mask': attention_mask,
-                'start_positions': start_positions,
-                'end_positions': end_positions,
-                'sent_ids': sent_ids
-            }
+            'input_ids': input_ids,
+            'token_type_ids': token_type_ids,
+            'attention_mask': attention_mask,
+            'start_positions': start_positions,
+            'end_positions': end_positions,
+            'example_ids': example_ids,
+            'masked_positions': masked_positions,
+            'has_answers' : has_answers
+        }
 
         return batched_data
+
 
 
 class SentenceClassificationDataset(Dataset):

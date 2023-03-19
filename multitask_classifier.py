@@ -58,9 +58,9 @@ class MultitaskBERT(nn.Module):
         self.similarity_classifier = nn.Linear(BERT_HIDDEN_SIZE * 2, 1)
         self.self_supervised_attention = nn.Linear(BERT_HIDDEN_SIZE, BERT_HIDDEN_SIZE)
         self.qa_classifier = nn.Linear(BERT_HIDDEN_SIZE, 2)
+        self.no_answer_classifier = nn.Linear(BERT_HIDDEN_SIZE, 1)
 
-
-    def forward(self, input_ids, attention_mask, masked_positions=None):
+    def forward(self, input_ids, attention_mask, masked_positions=None, return_sequence=False):
         'Takes a batch of sentences and produces embeddings for them.'
         # The final BERT embedding is the hidden state of [CLS] token (the first token)
         # Here, you can start by just returning the embeddings straight from BERT.
@@ -69,7 +69,10 @@ class MultitaskBERT(nn.Module):
         ### TODO
         bert_output = self.bert(input_ids, attention_mask=attention_mask)
         last_hidden_state = bert_output["last_hidden_state"]
-        cls_embedding = last_hidden_state[:, 0, :]
+        if return_sequence:
+            cls_embedding = last_hidden_state
+        else:
+            cls_embedding = last_hidden_state[:, 0, :]
         
         if masked_positions is not None:
             batch_size, num_masked_positions = masked_positions.size()
@@ -84,57 +87,69 @@ class MultitaskBERT(nn.Module):
             return cls_embedding
 
 
-    def predict_sentiment(self, input_ids, attention_mask):
+    def predict_sentiment(self, input_ids, attention_mask, masked_positions=None):
         '''Given a batch of sentences, outputs logits for classifying sentiment.
         There are 5 sentiment classes:
         (0 - negative, 1- somewhat negative, 2- neutral, 3- somewhat positive, 4- positive)
         Thus, your output should contain 5 logits for each sentence.
         '''
         ### TODO
-        cls_embeddings = self.forward(input_ids, attention_mask)
+        cls_embeddings, attention_weights = self.forward(input_ids, attention_mask, masked_positions)
         sentiment_logits = self.sentiment_classifier(cls_embeddings)
-        return sentiment_logits
+        return sentiment_logits, attention_weights
 
 
     def predict_paraphrase(self,
                            input_ids_1, attention_mask_1,
-                           input_ids_2, attention_mask_2):
+                           input_ids_2, attention_mask_2, 
+                           masked_positions_1=None, masked_positions_2=None):
         '''Given a batch of pairs of sentences, outputs a single logit for predicting whether they are paraphrases.
         Note that your output should be unnormalized (a logit); it will be passed to the sigmoid function
         during evaluation, and handled as a logit by the appropriate loss function.
         '''
-        cls_embeddings_1 = self.forward(input_ids_1, attention_mask_1)
-        cls_embeddings_2 = self.forward(input_ids_2, attention_mask_2)
+        cls_embeddings_1, attention_weights1 = self.forward(input_ids_1, attention_mask_1, masked_positions_1)
+        cls_embeddings_2, attention_weights2 = self.forward(input_ids_2, attention_mask_2, masked_positions_2)
         concatenated_embeddings = torch.cat((cls_embeddings_1, cls_embeddings_2), dim=1)
         paraphrase_logit = self.paraphrase_classifier(concatenated_embeddings)
-        return paraphrase_logit
+        return paraphrase_logit, attention_weights1, attention_weights2
 
 
     def predict_similarity(self,
                            input_ids_1, attention_mask_1,
-                           input_ids_2, attention_mask_2):
+                           input_ids_2, attention_mask_2,
+                           masked_positions_1=None, masked_positions_2=None):
         '''Given a batch of pairs of sentences, outputs a single logit corresponding to how similar they are.
         Note that your output should be unnormalized (a logit); it will be passed to the sigmoid function
         during evaluation, and handled as a logit by the appropriate loss function.
         '''
-        cls_embeddings_1 = self.forward(input_ids_1, attention_mask_1)
-        cls_embeddings_2 = self.forward(input_ids_2, attention_mask_2)
+        cls_embeddings_1, attention_weights1 = self.forward(input_ids_1, attention_mask_1, masked_positions_1)
+        cls_embeddings_2, attention_weights2 = self.forward(input_ids_2, attention_mask_2, masked_positions_2)
         concatenated_embeddings = torch.cat((cls_embeddings_1, cls_embeddings_2), dim=1)
         similarity_logit = self.similarity_classifier(concatenated_embeddings)
-        return similarity_logit
+        return similarity_logit, attention_weights1, attention_weights2
     
-    def predict_qa(self, input_ids, attention_mask):
+    def predict_qa(self, input_ids, attention_mask, masked_positions=None):
         '''Given a batch of context-question pairs, outputs logits for the start and end positions of the answer span.
         The output should be a tuple containing two tensors:
         - start_logits: a tensor of shape (batch_size, sequence_length)
         - end_logits: a tensor of shape (batch_size, sequence_length)
         '''
-        cls_embeddings = self.forward(input_ids, attention_mask)
-        qa_logits = self.qa_classifier(cls_embeddings)  # Shape: (batch_size, sequence_length, 2)
+        bert_output, attention_weights = self.forward(input_ids, attention_mask, masked_positions, return_sequence=True)
+        qa_logits = self.qa_classifier(bert_output)  # Shape: (batch_size, sequence_length, 2)
         start_logits, end_logits = qa_logits.split(1, dim=-1)  # Split along the last dimension
         start_logits = start_logits.squeeze(-1)  # Shape: (batch_size, sequence_length)
         end_logits = end_logits.squeeze(-1)  # Shape: (batch_size, sequence_length)
-        return start_logits, end_logits
+        
+        no_answer_logits = self.no_answer_classifier(bert_output[:, 0, :]).squeeze(-1)  # Shape: (batch_size,)
+
+        # Normalize the start_logits, end_logits, and no_answer_logits
+        start_logits = torch.cat([start_logits, no_answer_logits.unsqueeze(-1)], dim=-1)
+        end_logits = torch.cat([end_logits, no_answer_logits.unsqueeze(-1)], dim=-1)
+
+        start_logits = F.softmax(start_logits, dim=-1)
+        end_logits = F.softmax(end_logits, dim=-1)
+        
+        return start_logits, end_logits, attention_weights
 
 
 
@@ -159,7 +174,7 @@ def train_multitask(args):
     
     # Load data
     sst_train_data, para_train_data, sts_train_data, squad_train_data, num_labels = load_multitask_data(args.sst_train,args.para_train,args.sts_train,args.squad_train, split ='train')
-    sst_dev_data, para_dev_data, sts_dev_data, squad_dev_data = load_multitask_data(args.sst_dev,args.para_dev,args.sts_dev,args.squad_dev, split ='train')
+    sst_dev_data, para_dev_data, sts_dev_data, squad_dev_data, num_labels = load_multitask_data(args.sst_dev,args.para_dev,args.sts_dev,args.squad_dev, split ='test')
     
     # Create the datasets
     sst_train_data = SentenceClassificationDataset(sst_train_data, args)
@@ -175,7 +190,7 @@ def train_multitask(args):
     squad_dev_data = SquadDataset(squad_dev_data, args)
 
     multitask_train_data = MultitaskDataset(sst_train_data, para_train_data, sts_train_data, squad_train_data)
-    multitask_dev_data = MultitaskDataset(sst_dev_data, para_dev_data, sts_dev_data, squad_dev_data)
+    # multitask_dev_data = MultitaskDataset(sst_dev_data, para_dev_data, sts_dev_data, squad_dev_data)
     
     # Create the dataloaders
     sst_train_dataloader = DataLoader(sst_train_data, shuffle=True, batch_size=args.batch_size,
@@ -194,7 +209,7 @@ def train_multitask(args):
                                     collate_fn=sts_dev_data.collate_fn)
     
     multitask_train_dataloader = DataLoader(multitask_train_data, shuffle=True, batch_size=args.batch_size,
-                                            collate_fn=MultitaskDataset.collate_fn)
+                                            collate_fn=multitask_train_data.collate_fn)
     
     # Init model
     config = {'hidden_dropout_prob': args.hidden_dropout_prob,
@@ -232,36 +247,39 @@ def train_multitask(args):
             optimizer.zero_grad()
 
             # Process the SST batch
-            sst_logits, sst_attention_weights = model.predict_sentiment_ssa(sst_batch["token_ids"], sst_batch["attention_mask"], sst_batch["masked_positions"])
-            sst_loss = sst_loss_fn(sst_logits, sst_batch["labels"])
-            sst_ssa_loss = F.cross_entropy(sst_attention_weights, sst_batch["masked_positions"].view(-1), reduction='sum', ignore_index=-1) / (args.batch_size * sst_batch["masked_positions"].size(1))
+            sst_logits, sst_attention_weights = model.predict_sentiment(sst_batch["token_ids"], sst_batch["attention_mask"], sst_batch["masked_positions"])
+            sst_loss = sst_loss_fn(sst_logits.squeeze(-1), sst_batch["labels"])
+            sst_ssa_loss = F.cross_entropy(sst_attention_weights, sst_batch["masked_positions"].view(-1).long(), reduction='sum', ignore_index=-1) / (args.batch_size * sst_batch["masked_positions"].size(1))
 
             # Process the paraphrase batch
-            para_logits, para_attention_weights = model.predict_paraphrase_ssa(para_batch["token_ids1"], para_batch["attention_mask1"], para_batch["masked_positions1"],
-                                                                            para_batch["token_ids2"], para_batch["attention_mask2"], para_batch["masked_positions2"])
-            para_loss = para_loss_fn(para_logits.squeeze(-1), para_batch["labels"])
-            para_ssa_loss = F.cross_entropy(para_attention_weights, para_batch["masked_positions1"].view(-1), reduction='sum', ignore_index=-1) / (args.batch_size * para_batch["masked_positions1"].size(1))
-            para_ssa_loss += F.cross_entropy(para_attention_weights, para_batch["masked_positions2"].view(-1), reduction='sum', ignore_index=-1) / (args.batch_size * para_batch["masked_positions2"].size(1))
+            para_logits, para_attention_weights1, para_attention_weights2 = model.predict_paraphrase(para_batch["token_ids_1"], para_batch["attention_mask_1"],
+                                                                            para_batch["token_ids_2"], para_batch["attention_mask_2"], 
+                                                                            para_batch["masked_positions_1"], para_batch["masked_positions_2"])
+            para_loss = para_loss_fn(para_logits.squeeze(-1).float(), para_batch["labels"].float())
+            para_ssa_loss = F.cross_entropy(para_attention_weights1, para_batch["masked_positions_1"].view(-1).long(), reduction='sum', ignore_index=-1) / (args.batch_size * para_batch["masked_positions_1"].size(1))
+            para_ssa_loss += F.cross_entropy(para_attention_weights2, para_batch["masked_positions_2"].view(-1).long(), reduction='sum', ignore_index=-1) / (args.batch_size * para_batch["masked_positions_2"].size(1))
 
             # Process the STS batch
-            sts_logits, sts_attention_weights = model.predict_similarity_ssa(sts_batch["token_ids1"], sts_batch["attention_mask1"], sts_batch["masked_positions1"],
-                                                                            sts_batch["token_ids2"], sts_batch["attention_mask2"], sts_batch["masked_positions2"])
-            sts_loss = sts_loss_fn(sts_logits.squeeze(-1), sts_batch["labels"])
-            sts_ssa_loss = F.cross_entropy(sts_attention_weights, sts_batch["masked_positions1"].view(-1), reduction='sum', ignore_index=-1) / (args.batch_size * sts_batch["masked_positions1"].size(1))
-            sts_ssa_loss += F.cross_entropy(sts_attention_weights, sts_batch["masked_positions2"].view(-1), reduction='sum', ignore_index=-1) / (args.batch_size * sts_batch["masked_positions2"].size(1))
+            sts_logits, sts_attention_weights1, sts_attention_weights2 = model.predict_similarity(sts_batch["token_ids_1"], sts_batch["attention_mask_1"],
+                                                                            sts_batch["token_ids_2"], sts_batch["attention_mask_2"], 
+                                                                            sts_batch["masked_positions_1"], sts_batch["masked_positions_2"])
+            sts_loss = sts_loss_fn(sts_logits.squeeze(-1), sts_batch["labels"].float())
+            sts_ssa_loss = F.cross_entropy(sts_attention_weights1, sts_batch["masked_positions_1"].view(-1).long(), reduction='sum', ignore_index=-1) / (args.batch_size * sts_batch["masked_positions_1"].size(1))
+            sts_ssa_loss += F.cross_entropy(sts_attention_weights2, sts_batch["masked_positions_2"].view(-1).long(), reduction='sum', ignore_index=-1) / (args.batch_size * sts_batch["masked_positions_2"].size(1))
 
             # Process the SQuAD batch
-            squad_start_logits, squad_end_logits, squad_attention_weights = model.predict_qa_ssa(squad_batch["token_ids"], squad_batch["attention_mask"], squad_batch["masked_positions"])
+            squad_start_logits, squad_end_logits, squad_attention_weights = model.predict_qa(squad_batch["input_ids"], squad_batch["attention_mask"], squad_batch["masked_positions"])
+            
             qa_start_loss = qa_loss_fn(squad_start_logits, squad_batch["start_positions"])
             qa_end_loss = qa_loss_fn(squad_end_logits, squad_batch["end_positions"])
             qa_loss = (qa_start_loss + qa_end_loss) / 2
-            squad_ssa_loss = F.cross_entropy(squad_attention_weights, squad_batch["masked_positions"].view(-1), reduction='sum', ignore_index=-1) / (args.batch_size * squad_batch["masked_positions"].size(1))
+            squad_ssa_loss = F.cross_entropy(squad_attention_weights, squad_batch["masked_positions"].view(-1).long(), reduction='sum', ignore_index=-1) / (args.batch_size * squad_batch["masked_positions"].size(1))
 
             # Combine the losses
-            total_loss = sst_loss + args.ssa_loss_weight * sst_ssa_loss \
-                    + para_loss + args.ssa_loss_weight * para_ssa_loss \
-                    + sts_loss + args.ssa_loss_weight * sts_ssa_loss \
-                    + qa_loss + args.ssa_loss_weight * squad_ssa_loss
+            total_loss = sst_loss  + args.ssa_loss_weight * sst_ssa_loss \
+                       + para_loss + args.ssa_loss_weight * para_ssa_loss \
+                       + sts_loss  + args.ssa_loss_weight * sts_ssa_loss \
+                       + qa_loss   + args.ssa_loss_weight * squad_ssa_loss
 
             total_loss.backward()
             optimizer.step()

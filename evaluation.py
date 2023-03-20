@@ -174,7 +174,7 @@ def model_eval_test_multitask(sentiment_dataloader,
             b_ids2 = b_ids2.to(device)
             b_mask2 = b_mask2.to(device)
 
-            logits = model.predict_paraphrase(b_ids1, b_mask1, b_ids2, b_mask2)
+            logits, *_ = model.predict_paraphrase(b_ids1, b_mask1, b_ids2, b_mask2)
             y_hat = logits.sigmoid().round().flatten().cpu().numpy()
 
             para_y_pred.extend(y_hat)
@@ -198,7 +198,7 @@ def model_eval_test_multitask(sentiment_dataloader,
             b_ids2 = b_ids2.to(device)
             b_mask2 = b_mask2.to(device)
 
-            logits = model.predict_similarity(b_ids1, b_mask1, b_ids2, b_mask2)
+            logits, *_ = model.predict_similarity(b_ids1, b_mask1, b_ids2, b_mask2)
             y_hat = logits.flatten().cpu().numpy()
 
             sts_y_pred.extend(y_hat)
@@ -215,7 +215,7 @@ def model_eval_test_multitask(sentiment_dataloader,
             b_ids = b_ids.to(device)
             b_mask = b_mask.to(device)
 
-            logits = model.predict_sentiment(b_ids, b_mask)
+            logits, *_ = model.predict_sentiment(b_ids, b_mask)
             y_hat = logits.argmax(dim=-1).flatten().cpu().numpy()
 
             sst_y_pred.extend(y_hat)

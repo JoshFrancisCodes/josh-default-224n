@@ -60,15 +60,19 @@ class MultitaskBERT(nn.Module):
         self.qa_classifier = nn.Linear(BERT_HIDDEN_SIZE, 2)
         self.no_answer_classifier = nn.Linear(BERT_HIDDEN_SIZE, 1)
 
-    def forward(self, input_ids, attention_mask, masked_positions=None, return_sequence=False):
+    def forward(self, input_ids, attention_mask, masked_positions=None, return_sequence=False, return_attention_weights=False):
         'Takes a batch of sentences and produces embeddings for them.'
         # The final BERT embedding is the hidden state of [CLS] token (the first token)
         # Here, you can start by just returning the embeddings straight from BERT.
         # When thinking of improvements, you can later try modifying this
         # (e.g., by adding other layers).
         ### TODO
-        bert_output = self.bert(input_ids, attention_mask=attention_mask)
+        bert_output = self.bert(input_ids, attention_mask=attention_mask, return_attention_weights=return_attention_weights)
+        if return_attention_weights:
+            bert_attention_weights = bert_output['attention_weights']
+            
         last_hidden_state = bert_output["last_hidden_state"]
+        
         if return_sequence:
             cls_embedding = last_hidden_state
         else:
@@ -82,21 +86,32 @@ class MultitaskBERT(nn.Module):
             masked_hidden_states = last_hidden_state[input_indices, masked_positions_flat]
             attention_weights = self.self_supervised_attention(masked_hidden_states)
             attention_weights = attention_weights.float()
-            return cls_embedding, attention_weights
+            if return_attention_weights:
+                return cls_embedding, attention_weights, bert_attention_weights
+            else:
+                return cls_embedding, attention_weights
         else:
-            return cls_embedding, None
+            if return_attention_weights:
+                return cls_embedding, None, bert_attention_weights
+            else:
+                return cls_embedding, None
 
 
-    def predict_sentiment(self, input_ids, attention_mask, masked_positions=None):
+    def predict_sentiment(self, input_ids, attention_mask, masked_positions=None, return_attention_weights=False):
         '''Given a batch of sentences, outputs logits for classifying sentiment.
         There are 5 sentiment classes:
         (0 - negative, 1- somewhat negative, 2- neutral, 3- somewhat positive, 4- positive)
         Thus, your output should contain 5 logits for each sentence.
         '''
         ### TODO
-        cls_embeddings, attention_weights = self.forward(input_ids, attention_mask, masked_positions)
-        sentiment_logits = self.sentiment_classifier(cls_embeddings)
-        return sentiment_logits, attention_weights
+        if return_attention_weights:
+            cls_embeddings, attention_weights, bert_attention = self.forward(input_ids, attention_mask, masked_positions, return_attention_weights=True)
+            sentiment_logits = self.sentiment_classifier(cls_embeddings)
+            return sentiment_logits, attention_weights, bert_attention
+        else:
+            cls_embeddings, attention_weights = self.forward(input_ids, attention_mask, masked_positions)
+            sentiment_logits = self.sentiment_classifier(cls_embeddings)
+            return sentiment_logits, attention_weights
 
 
     def predict_paraphrase(self,

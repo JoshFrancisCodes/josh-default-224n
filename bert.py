@@ -38,7 +38,7 @@ class BertSelfAttention(nn.Module):
     proj = proj.transpose(1, 2)
     return proj
 
-  def attention(self, key, query, value, attention_mask):
+  def attention(self, key, query, value, attention_mask, return_attention_weights=False):
     # each attention is calculated following eq (1) of https://arxiv.org/pdf/1706.03762.pdf
     # attention scores are calculated by multiply query and key 
     # and get back a score matrix S of [bs, num_attention_heads, seq_len, seq_len]
@@ -66,14 +66,15 @@ class BertSelfAttention(nn.Module):
     # Concatenate the outputs from all attention heads and project them back to the hidden size
     bs = key.size()[0]
     seq_len = key.size()[2]
-    # print(key.shape, query.shape, value.shape)
-    # print(bs, seq_len, self.all_head_size, self.num_attention_heads, self.attention_head_size, context.shape)
     context = context.transpose(1, 2).contiguous().view(bs, seq_len, self.attention_head_size * self.num_attention_heads)
-    # print(context.shape)
-    return context
+
+    if return_attention_weights:
+        return context, attention_probs
+    else:
+        return context
 
 
-  def forward(self, hidden_states, attention_mask):
+  def forward(self, hidden_states, attention_mask, return_attention_weights=False):
     """
     hidden_states: [bs, seq_len, hidden_state]
     attention_mask: [bs, 1, 1, seq_len]
@@ -85,8 +86,12 @@ class BertSelfAttention(nn.Module):
     value_layer = self.transform(hidden_states, self.value)
     query_layer = self.transform(hidden_states, self.query)
     # calculate the multi-head attention 
-    attn_value = self.attention(key_layer, query_layer, value_layer, attention_mask)
-    return attn_value
+    if return_attention_weights:
+      attn_value, attention_weights = self.attention(key_layer, query_layer, value_layer, attention_mask, return_attention_weights)
+      return attn_value, attention_weights
+    else:
+      attn_value = self.attention(key_layer, query_layer, value_layer, attention_mask)
+      return attn_value
 
 
 class BertLayer(nn.Module):
@@ -131,7 +136,7 @@ class BertLayer(nn.Module):
     return output
 
 
-  def forward(self, hidden_states, attention_mask):
+  def forward(self, hidden_states, attention_mask, return_attention_weights=False):
     """
     hidden_states: either from the embedding layer (first bert layer) or from the previous bert layer
     as shown in the left of Figure 1 of https://arxiv.org/pdf/1706.03762.pdf 
@@ -142,7 +147,10 @@ class BertLayer(nn.Module):
     4. a add-norm that takes the input and output of the feed forward layer
     """
     # # apply the multi-head attention layer
-    attention_output = self.self_attention(hidden_states, attention_mask)
+    if return_attention_weights:
+      attention_output, attention_weights = self.self_attention(hidden_states, attention_mask, return_attention_weights=True)
+    else:
+      attention_output = self.self_attention(hidden_states, attention_mask)
 
     # apply the first add-norm layer
     add_norm_output_1 = self.add_norm(hidden_states, attention_output, self.attention_dense, self.attention_dropout, self.attention_layer_norm)
@@ -153,7 +161,10 @@ class BertLayer(nn.Module):
     # apply the second add-norm layer
     add_norm_output_2 = self.add_norm(add_norm_output_1, feed_forward_output, self.out_dense, self.out_dropout, self.out_layer_norm)
 
-    return add_norm_output_2
+    if return_attention_weights:
+      return add_norm_output_2, attention_weights
+    else:
+      return add_norm_output_2
 
 
 
@@ -218,7 +229,7 @@ class BertModel(BertPreTrainedModel):
     
 
 
-  def encode(self, hidden_states, attention_mask):
+  def encode(self, hidden_states, attention_mask, return_attention_weights=False):
     """
     hidden_states: the output from the embedding layer [batch_size, seq_len, hidden_size]
     attention_mask: [batch_size, seq_len]
@@ -229,13 +240,22 @@ class BertModel(BertPreTrainedModel):
     extended_attention_mask: torch.Tensor = get_extended_attention_mask(attention_mask, self.dtype)
 
     # pass the hidden states through the encoder layers
+    all_attention_weights = []
     for i, layer_module in enumerate(self.bert_layers):
-      # feed the encoding from the last bert_layer to the next
-      hidden_states = layer_module(hidden_states, extended_attention_mask)
+        # feed the encoding from the last bert_layer to the next
+        if return_attention_weights:
+            hidden_states, attention_weights = layer_module(hidden_states, extended_attention_mask, return_attention_weights=True)
+            all_attention_weights.append(attention_weights)
+        else:
+            hidden_states = layer_module(hidden_states, extended_attention_mask)
 
-    return hidden_states
+    if return_attention_weights:
+        return hidden_states, all_attention_weights
+    else:
+        return hidden_states
 
-  def forward(self, input_ids, attention_mask):
+
+  def forward(self, input_ids, attention_mask, return_attention_weights=False):
     """
     input_ids: [batch_size, seq_len], seq_len is the max length of the batch
     attention_mask: same size as input_ids, 1 represents non-padding tokens, 0 represents padding tokens
@@ -244,11 +264,17 @@ class BertModel(BertPreTrainedModel):
     embedding_output = self.embed(input_ids=input_ids)
 
     # feed to a transformer (a stack of BertLayers)
-    sequence_output = self.encode(embedding_output, attention_mask=attention_mask)
-
+    if return_attention_weights:
+      sequence_output, attention_weights = self.encode(embedding_output, attention_mask=attention_mask, return_attention_weights=True)
+    else:
+      sequence_output = self.encode(embedding_output, attention_mask=attention_mask)
     # get cls token hidden state
     first_tk = sequence_output[:, 0]
     first_tk = self.pooler_dense(first_tk)
     first_tk = self.pooler_af(first_tk)
 
-    return {'last_hidden_state': sequence_output, 'pooler_output': first_tk}
+    if return_attention_weights:
+        return {'last_hidden_state': sequence_output, 'pooler_output': first_tk, 'attention_weights': attention_weights}
+    else:
+        return {'last_hidden_state': sequence_output, 'pooler_output': first_tk}
+
